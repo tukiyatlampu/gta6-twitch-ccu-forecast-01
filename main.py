@@ -1,499 +1,526 @@
+"""Hourly Twitch-viewer forecasts for a game release day.
+
+An input case holds the first hour's viewer print together with the
+hourly curves of earlier comparable launches. For each later hour the
+program fits a robust regression of the log ratio to the hour-1 print
+on the hour-1 log print across those comparables, then derives the
+spread from held-out residuals of the same comparables. The result is
+five quantiles per hour for hours 2..24. Standard library only, no
+network access, and fully deterministic: identical input bytes always
+produce identical output bytes.
+"""
+
 import json
 import math
 import os
 
+# Tuned constants, fixed from the practice launches. Both the fitted
+# lines and the spreads adapt to each case while it runs; no constant
+# here encodes an answer for any particular launch.
+RIDGE_EQUIV_OBS = 1.1
+RIDGE_FLOOR_SD = 0.35
+HUBER_LIMIT = 1.8
+HUBER_FLOOR = 0.15
+HUBER_ROUNDS = 3
+NEIGHBOUR_PULL = 0.12
+RESID_FOLDS = 7
+LOCAL_MIX = 0.30
+KERNEL_WIDTH = 1.25
+EDGE_USE = 0.55
+EDGE_CAP = 0.90
+FULL_WEIGHT_N = 8
+DRIFT_SIGMA = 0.15
+SPREAD_FLOOR = 0.55
+TAIL_CAP = 2.8
+TAIL_EPS = 1e-6
+FORECAST_HOURS = tuple(range(2, 25))
+STD_LEVELS = (0.05, 0.25, 0.50, 0.75, 0.95)
+STD_ZSCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
+CUM_DAYS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+DAYS_IN_MONTH = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+MICROS_PER_SEC = 1_000_000
+MICROS_PER_HOUR = 3600 * MICROS_PER_SEC
+Q_CEILING = 1_000_000_000.0
+LOG_CEILING = math.log(Q_CEILING)
+LOG_FLOOR = math.log(1e-6)
 
-# ============================== CONFIG ==============================
+# ---- scalar helpers ----
+def as_list(maybe):
+    """Keep lists as they are; anything else behaves like an empty list."""
+    if isinstance(maybe, list):
+        return maybe
+    return ()
+def as_number(maybe):
+    """Coerce a real int or float to a finite float; anything else is None."""
+    if type(maybe) not in (int, float):
+        return None  # strings, bools, nulls and containers are not prints
+    try:  # float() raises on ints too large for a double
+        converted = float(maybe)
+    except OverflowError as _big:
+        return None  # magnitude beyond the float range
+    if math.isfinite(converted):
+        return converted
+    return None
 
-# Ridge penalty in equivalent observations at the hour's predictor variance.
-RIDGE_ROWS = 1.1
-# Minimum log-viewer standard deviation used to set the ridge penalty.
-RIDGE_MIN_X_SD = 0.35
-# Huber cutoff in robust residual standard deviations.
-HUBER_CUTOFF = 1.8
-# Minimum robust residual scale used when computing Huber weights.
-HUBER_MIN_SCALE = 0.15
-# Number of reweighted regression passes after the initial ridge fit.
-HUBER_PASSES = 3
-# Smoothing weight for each available immediately adjacent hour.
-ADJACENT_WEIGHT = 0.12
-# Number of rank-stratified folds used to collect held-out residuals.
-CALIBRATION_FOLDS = 7
-# Fraction of residual weight assigned to the local rather than pooled sample.
-LOCAL_RESIDUAL_FRACTION = 0.30
-# Gaussian kernel bandwidth for local calibration, in log hour-1 viewers.
-LOCAL_BANDWIDTH = 1.25
-# Fraction of the distance outside the training range used in the regression.
-EXTRAPOLATION_FRACTION = 0.55
-# Maximum effective predictor displacement beyond either training edge.
-MAX_EXTRAPOLATION_LOG = 0.90
-# Number of usable comparable pairs needed for full model weight.
-FULL_MODEL_COUNT = 8
-# Persistence log standard deviation per square root hour of lead time.
-PERSISTENCE_SIGMA = 0.15
-# Minimum model spread as a fraction of the persistence spread.
-SPREAD_FLOOR_FRACTION = 0.55
-# Maximum log-quantile distance on either side of the model median.
-MAX_TAIL_LOG_DISTANCE = 2.8
-# Probability clipping for normal scores at nonstandard endpoint levels.
-NORMAL_LEVEL_EPSILON = 1e-6
+# ---- timestamps ----
+def to_micros(text):
+    """Parse an ISO-8601 timestamp into integer microseconds since year 1.
 
-# =========================== END CONFIG =============================
-
-HOURS = tuple(range(2, 25))
-DEFAULT_LEVELS = (0.05, 0.25, 0.50, 0.75, 0.95)
-DEFAULT_Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
-MONTH_START = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
-MONTH_LENGTH = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-SECOND = 1_000_000
-HOUR = 3600 * SECOND
-MAX_Q = 1_000_000_000.0
-LOG_MAX_Q = math.log(MAX_Q)
-LOG_MIN_Q = math.log(1e-6)
-
-
-def array(value):
-    return value if isinstance(value, list) else ()
-
-
-def number(value):
-    if type(value) not in (int, float):
-        return None
-    try:
-        value = float(value)
-    except OverflowError:
-        return None
-    return value if math.isfinite(value) else None
-
-
-def utc_stamp(value):
-    """Convert an ISO timestamp to integer microseconds on a common UTC axis."""
-    if (
-        not isinstance(value, str)
-        or len(value) < 16
-        or value[4] != "-"
-        or value[7] != "-"
-        or value[10] not in "Tt "
-        or value[13] != ":"
-    ):
-        return None
-    try:
-        year = int(value[:4])
-        month = int(value[5:7])
-        day = int(value[8:10])
-        hour = int(value[11:13])
-        minute = int(value[14:16])
-        if not (1 <= year and 1 <= month <= 12 and
-                0 <= hour < 24 and 0 <= minute < 60):
-            return None
-        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-        if not 1 <= day <= MONTH_LENGTH[month - 1] + (leap and month == 2):
-            return None
-
-        pos = 16
-        sec = micros = 0
-        if value[pos:pos + 1] == ":":
-            sec = int(value[pos + 1:pos + 3])
-            if len(value) < pos + 3 or not 0 <= sec < 60:
-                return None
-            pos += 3
-        if value[pos:pos + 1] in (".", ","):
-            start = pos + 1
-            pos = start
-            while pos < len(value) and "0" <= value[pos] <= "9":
-                pos += 1
-            if pos == start:
-                return None
-            micros = int(value[start:min(pos, start + 6)].ljust(6, "0"))
-
-        zone = value[pos:]
-        offset = 0
-        if zone not in ("", "Z", "z"):
-            if zone[0] not in "+-":
-                return None
-            if len(zone) == 6 and zone[3] == ":":
-                zh, zm = int(zone[1:3]), int(zone[4:6])
-            elif len(zone) == 5:
-                zh, zm = int(zone[1:3]), int(zone[3:5])
-            elif len(zone) == 3:
-                zh, zm = int(zone[1:3]), 0
+    Accepts a 'T', 't' or space separator, optional seconds and
+    fraction, and a 'Z' or numeric zone offset. Anything malformed
+    yields None so callers fall back instead of crashing on corrupt
+    case data.
+    """
+    shape_ok = (
+        isinstance(text, str)
+        and len(text) >= 16
+        and text[4] == "-"
+        and text[7] == "-"
+        and text[10] in "Tt "
+        and text[13] == ":"
+    )
+    if not shape_ok:
+        return None  # not shaped like an ISO timestamp at all
+    try:  # every int() below can reject a non-numeric field
+        yy = int(text[0:4])
+        mo = int(text[5:7])
+        dd = int(text[8:10])
+        hh = int(text[11:13])
+        mi = int(text[14:16])
+        leap = yy % 4 == 0 and (yy % 100 != 0 or yy % 400 == 0)
+        if yy < 1 or mo < 1 or mo > 12 or hh < 0 or hh >= 24 or mi < 0 or mi >= 60:
+            return None  # a date or time field is out of range
+        if dd < 1 or dd > DAYS_IN_MONTH[mo - 1] + (leap and mo == 2):
+            return None  # impossible day of the month
+        cursor = 16
+        sec = 0
+        frac = 0
+        if text[cursor:cursor + 1] == ":":
+            sec = int(text[cursor + 1:cursor + 3])
+            if len(text) < cursor + 3 or sec < 0 or sec >= 60:
+                return None  # seconds field missing or out of range
+            cursor += 3
+        if text[cursor:cursor + 1] in (".", ","):
+            begin = cursor + 1
+            cursor = begin
+            while cursor < len(text) and "0" <= text[cursor] <= "9":
+                cursor += 1
+            if cursor == begin:
+                return None  # fraction marker with no digits after it
+            frac = int(text[begin:min(cursor, begin + 6)].ljust(6, "0"))
+        zone = text[cursor:]
+        shift = 0
+        if zone and zone not in ("Z", "z"):
+            if zone[0] not in ("+", "-"):
+                return None  # a zone offset must start with a sign
+            zlen = len(zone)
+            if zlen == 6 and zone[3] == ":":
+                zh = int(zone[1:3])
+                zm = int(zone[4:6])
+            elif zlen == 5:
+                zh = int(zone[1:3])
+                zm = int(zone[3:5])
+            elif zlen == 3:
+                zh = int(zone[1:3])
+                zm = 0
             else:
-                return None
-            if not (0 <= zh < 24 and 0 <= zm < 60):
-                return None
-            offset = (1 if zone[0] == "+" else -1) * (60 * zh + zm)
+                return None  # unrecognised zone shape
+            if zh < 0 or zh >= 24 or zm < 0 or zm >= 60:
+                return None  # zone offset out of range
+            shift = (60 * zh + zm) if zone[0] == "+" else -(60 * zh + zm)
+        prior = yy - 1
+        days = 365 * prior + prior // 4 - prior // 100 + prior // 400
+        days += CUM_DAYS[mo - 1] + (leap and mo > 2) + dd - 1
+        whole = ((days * 24 + hh) * 3600 + (mi - shift) * 60 + sec) * MICROS_PER_SEC
+        return whole + frac
+    except ValueError as _bad:
+        return None  # a field was not numeric
 
-        y = year - 1
-        days = 365 * y + y // 4 - y // 100 + y // 400
-        days += MONTH_START[month - 1] + (leap and month > 2) + day - 1
-        return ((days * 24 + hour) * 3600 + (minute - offset) * 60 + sec) * SECOND + micros
-    except ValueError:
-        return None
+# ---- reading cases ----
+def hourly_averages(rows, start, count):
+    """Average viewer prints into consecutive hour buckets from a stamp.
 
+    Rows with bad timestamps, out-of-range buckets or non-numeric
+    viewers are skipped; buckets with no valid row stay None. The
+    running mean keeps its sign-aware update so corrupt opposite-sign
+    prints cannot overflow the subtraction.
+    """
+    sums = [0.0] * count
+    seen = [0] * count
+    if start is None:
+        return [None] * count
+    for rec in as_list(rows):
+        when = to_micros(rec.get("from")) if isinstance(rec, dict) else None
+        if when is None:
+            continue
+        slot = (when - start) // MICROS_PER_HOUR
+        if 0 <= slot < count:
+            val = as_number(rec.get("viewers"))
+            if val is not None:
+                seen[slot] += 1
+                n = seen[slot]
+                prev = sums[slot]
+                if n == 1:
+                    sums[slot] = val
+                elif (prev >= 0.0) == (val >= 0.0):
+                    sums[slot] = prev + (val - prev) / n
+                else:
+                    sums[slot] = prev * (1.0 - 1.0 / n) + val / n
+    out = []
+    for total, n in zip(sums, seen):
+        out.append(total if n else None)
+    return out
+def anchor_print(case):
+    """Recover the hour-1 print and whether a known row provided it.
 
-def hourly_means(rows, start, count):
-    """Bucket valid samples by 'from'; missing buckets stay missing."""
-    means = [0.0] * count
-    counts = [0] * count
-    if start is not None:
-        for row in array(rows):
-            if not isinstance(row, dict):
-                continue
-            stamp = utc_stamp(row.get("from"))
-            if stamp is None:
-                continue
-            idx = (stamp - start) // HOUR
-            if not 0 <= idx < count:
-                continue
-            v = number(row.get("viewers"))
-            if v is None:
-                continue
+    Preference order: a valid known row for hour 1, then the first
+    bucket of the hourly history, then the latest dated history print
+    at or before the checkpoint (an undated print is the last resort).
+    Prints below 1 count as 1; with nothing usable the anchor is 1.
+    """
+    for rec in as_list(case.get("known")):
+        if isinstance(rec, dict) and as_number(rec.get("hour")) == 1:
+            val = as_number(rec.get("viewers"))
+            if val is not None:
+                return max(1.0, val), True
+    start = to_micros(case.get("day_start"))
+    cut = to_micros(case.get("checkpoint"))
+    if start is None and cut is not None:
+        start = cut - MICROS_PER_HOUR
+    if cut is None and start is not None:
+        cut = start + MICROS_PER_HOUR
+    first = hourly_averages(case.get("history_hourly"), start, 1)[0]
+    if first is not None:
+        return max(1.0, first), False
+    best_stamp = None
+    best_val = None
+    dateless = None
+    for rec in as_list(case.get("history")):
+        if isinstance(rec, dict):
+            val = as_number(rec.get("viewers"))
+            if val is not None:
+                when = to_micros(rec.get("at"))
+                if when is None:
+                    dateless = val
+                elif (cut is None or when <= cut) and (best_stamp is None or when >= best_stamp):
+                    best_stamp = when
+                    best_val = val
+    picked = best_val if best_val is not None else dateless
+    if picked is None:
+        return 1.0, False
+    return max(1.0, picked), False
+def extract_curves(raw):
+    """Turn raw comparables into sorted (log hour-1, log-ratio) curves.
 
-            counts[idx] += 1
-            n = counts[idx]
-            old = means[idx]
-            if n == 1:
-                means[idx] = v
-            elif (old >= 0.0) == (v >= 0.0):
-                means[idx] = old + (v - old) / n
+    A comparable needs a parseable day start and a valid hour-1 bucket
+    plus at least one later valid bucket. Sorting keeps the fold
+    assignment and every floating-point sum independent of the order
+    comparables happen to arrive in.
+    """
+    def sort_key(curve):
+        base, ratios = curve
+        return (base, tuple(-math.inf if r is None else r for r in ratios))
+    found = []
+    for cand in as_list(raw):
+        t0 = to_micros(cand.get("day_start")) if isinstance(cand, dict) else None
+        if t0 is None:
+            continue
+        buckets = hourly_averages(cand.get("hourly"), t0, 24)
+        if buckets[0] is None:
+            continue
+        base = math.log(max(1.0, buckets[0]))
+        ratios = []
+        for val in buckets[1:]:
+            if val is None:
+                ratios.append(None)
             else:
-                # Avoid overflowing v - old for corrupt opposite-sign inputs.
-                means[idx] = old * (1.0 - 1.0 / n) + v / n
+                ratios.append(math.log(max(1.0, val)) - base)
+        if any(rv is not None for rv in ratios):
+            found.append((base, tuple(ratios)))
+    found.sort(key=sort_key)
+    return found
+def midpoint(vals):
+    """Middle value of a non-empty sample; mean of the central pair if even."""
+    ranked = sorted(vals)
+    n = len(ranked)
+    half = n // 2
+    if n % 2:
+        return ranked[half]
+    return 0.5 * (ranked[half - 1] + ranked[half])
 
-    return [v if n else None for v, n in zip(means, counts)]
+# ---- robust regression ----
+def ridge_fit(points, weights, penalty):
+    """Weighted straight-line fit with a ridge penalty on the slope."""
+    total_w = sum(weights)
+    mean_x = sum(w * px for (px, _py), w in zip(points, weights)) / total_w
+    mean_y = sum(w * py for (_px, py), w in zip(points, weights)) / total_w
+    sxx = 0.0
+    sxy = 0.0
+    for (px, py), w in zip(points, weights):
+        dx = px - mean_x
+        sxx += w * dx * dx
+        sxy += w * dx * (py - mean_y)
+    slope = sxy / (sxx + penalty)
+    return mean_y - slope * mean_x, slope
+def fit_one_hour(pts):
+    """Fit one hour's ratio line, with Huber reweighting when data is ample.
 
+    The ridge penalty scales with the predictor variance so hours with
+    little spread in hour-1 prints stay shrunk toward a flat line. The
+    robust scale is fixed from the first fit; only the line itself is
+    reweighted afterwards.
+    """
+    n = len(pts)
+    mean_x = sum(px for px, _py in pts) / n
+    var_x = sum((px - mean_x) ** 2 for px, _py in pts) / n
+    penalty = RIDGE_EQUIV_OBS * max(var_x, RIDGE_FLOOR_SD ** 2)
+    flat = [1.0] * n
+    a, b = ridge_fit(pts, flat, penalty)
+    if n >= FULL_WEIGHT_N:
+        errs = [py - (a + b * px) for px, py in pts]
+        middle = midpoint(errs)
+        spread = midpoint([abs(e - middle) for e in errs])
+        limit = HUBER_LIMIT * max(HUBER_FLOOR, 1.4826 * spread)
+        for _round in range(HUBER_ROUNDS):
+            wts = [1.0 if abs(e) <= limit else limit / abs(e) for e in errs]
+            a, b = ridge_fit(pts, wts, penalty)
+            errs = [py - (a + b * px) for px, py in pts]
+    return a, b, pts[0][0], pts[-1][0], n
+def fit_all_hours(curves):
+    """Fit every forecast hour, then smooth each line toward its neighbours.
 
-def hour_one(case):
-    """Return the anchor print and whether it came from a valid known row."""
-    for row in array(case.get("known")):
-        if not isinstance(row, dict) or number(row.get("hour")) != 1:
+    Only the line coefficients are smoothed; each hour keeps its own
+    training range and sample count, which the forecast uses for the
+    extrapolation clamp and the model-versus-persistence blend.
+    """
+    per_hour = [[] for _ in FORECAST_HOURS]
+    for base, ratios in curves:
+        for col, ratio in enumerate(ratios):
+            if ratio is not None:
+                per_hour[col].append((base, ratio))
+    raw = []
+    for pts in per_hour:
+        if pts:
+            raw.append(fit_one_hour(pts))
+        else:
+            raw.append(None)
+    done = []
+    for col, line in enumerate(raw):
+        if line is None:
+            done.append(None)
             continue
-        v = number(row.get("viewers"))
-        if v is not None:
-            return max(1.0, v), True
+        a, b, lo, hi, n = line
+        aa = a
+        bb = b
+        for other in (col - 1, col + 1):
+            if 0 <= other < len(raw) and raw[other] is not None:
+                na, nb, _lo, _hi, nn = raw[other]
+                w = NEIGHBOUR_PULL * min(1.0, nn / n)
+                aa += w * (na - a)
+                bb += w * (nb - b)
+        done.append((aa, bb, lo, hi, n))
+    return done
+def ratio_at(line, x):
+    """Evaluate a fitted line, allowing only damped extrapolation."""
+    a, b, lo, hi, _n = line
+    clamped = min(hi, max(lo, x))
+    push = EDGE_USE * (x - clamped)
+    push = max(-EDGE_CAP, min(EDGE_CAP, push))
+    return a + b * (clamped + push)
 
-    start = utc_stamp(case.get("day_start"))
-    checkpoint = utc_stamp(case.get("checkpoint"))
-    if start is None and checkpoint is not None:
-        start = checkpoint - HOUR
-    if checkpoint is None and start is not None:
-        checkpoint = start + HOUR
+# ---- held-out calibration ----
+def crossfit_errors(curves):
+    """Collect held-out residuals with rank-stratified folds.
 
-    v = hourly_means(case.get("history_hourly"), start, 1)[0]
-    if v is not None:
-        return max(1.0, v), False
+    Each fold refits on the other folds and scores the held-out curves,
+    so the calibration residuals never come from a fit that saw the
+    curve being scored. A fixed fold count keeps this cheap.
+    """
+    out = [[] for _ in FORECAST_HOURS]
+    folds = min(RESID_FOLDS, len(curves))
+    if folds < 2:
+        return out
+    for fold in range(folds):
+        train = []
+        for rank, row in enumerate(curves):
+            if rank % folds != fold:
+                train.append(row)
+        fits = fit_all_hours(train)
+        held = curves[fold::folds]
+        for base, ratios in held:
+            for col, ratio in enumerate(ratios):
+                if ratio is not None and fits[col] is not None:
+                    out[col].append((base, ratio - ratio_at(fits[col], base)))
+    return out
+def error_cdf(errors, target):
+    """Build a weighted empirical CDF of residuals near a target print.
 
-    latest = None
-    latest_value = None
-    undated_value = None
-    for row in array(case.get("history")):
-        if not isinstance(row, dict):
-            continue
-        v = number(row.get("viewers"))
-        if v is None:
-            continue
-        stamp = utc_stamp(row.get("at"))
-        if stamp is None:
-            undated_value = v
-        elif (checkpoint is None or stamp <= checkpoint) and (
-            latest is None or stamp >= latest
-        ):
-            latest, latest_value = stamp, v
-
-    v = latest_value if latest_value is not None else undated_value
-    return (max(1.0, v) if v is not None else 1.0), False
-
-
-def comparable_curves(raw):
-    curves = []
-    for entry in array(raw):
-        if not isinstance(entry, dict):
-            continue
-        start = utc_stamp(entry.get("day_start"))
-        if start is None:
-            continue
-        values = hourly_means(entry.get("hourly"), start, 24)
-        if values[0] is None:
-            continue
-        x = math.log(max(1.0, values[0]))
-        ratios = tuple(
-            None if v is None else math.log(max(1.0, v)) - x
-            for v in values[1:]
-        )
-        if any(r is not None for r in ratios):
-            curves.append((x, ratios))
-
-    # Keep folds and floating-point summations independent of input ordering.
-    curves.sort(key=lambda row: (
-        row[0], tuple(-math.inf if r is None else r for r in row[1])
-    ))
-    return curves
-
-
-def median(values):
-    ordered = sorted(values)
-    mid = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[mid]
-    return 0.5 * (ordered[mid - 1] + ordered[mid])
-
-
-def ridge_line(points, weights, ridge):
-    weight = sum(weights)
-    mx = sum(w * x for (x, _), w in zip(points, weights)) / weight
-    my = sum(w * y for (_, y), w in zip(points, weights)) / weight
-    xx = xy = 0.0
-    for (x, y), w in zip(points, weights):
-        dx = x - mx
-        xx += w * dx * dx
-        xy += w * dx * (y - my)
-    slope = xy / (xx + ridge)
-    return my - slope * mx, slope
-
-
-def fit_hour(points):
-    n = len(points)
-    mx = sum(x for x, _ in points) / n
-    var_x = sum((x - mx) ** 2 for x, _ in points) / n
-    ridge = RIDGE_ROWS * max(var_x, RIDGE_MIN_X_SD ** 2)
-    intercept, slope = ridge_line(points, [1.0] * n, ridge)
-
-    if n >= FULL_MODEL_COUNT:
-        residuals = [y - (intercept + slope * x) for x, y in points]
-        center = median(residuals)
-        mad = median(abs(r - center) for r in residuals)
-        cutoff = HUBER_CUTOFF * max(HUBER_MIN_SCALE, 1.4826 * mad)
-        # Fix the robust scale after the initial fit; reweight only the line.
-        for _ in range(HUBER_PASSES):
-            weights = [
-                1.0 if abs(r) <= cutoff else cutoff / abs(r)
-                for r in residuals
-            ]
-            intercept, slope = ridge_line(points, weights, ridge)
-            residuals = [y - (intercept + slope * x) for x, y in points]
-
-    return intercept, slope, points[0][0], points[-1][0], n
-
-
-def fit_curves(curves):
-    by_hour = [[] for _ in HOURS]
-    for x, ratios in curves:
-        for idx, y in enumerate(ratios):
-            if y is not None:
-                by_hour[idx].append((x, y))
-
-    raw = [fit_hour(points) if points else None for points in by_hour]
-    smooth = []
-    for idx, fit in enumerate(raw):
-        if fit is None:
-            smooth.append(None)
-            continue
-        a, b, lo, hi, n = fit
-        # Smooth the lines, not the training range or the sample count.
-        ai, bi = a, b
-        for neighbor in (idx - 1, idx + 1):
-            if 0 <= neighbor < len(raw) and raw[neighbor] is not None:
-                na, nb, _, _, nn = raw[neighbor]
-                w = ADJACENT_WEIGHT * min(1.0, nn / n)
-                ai += w * (na - a)
-                bi += w * (nb - b)
-        smooth.append((ai, bi, lo, hi, n))
-    return smooth
-
-
-def fitted_ratio(fit, x):
-    a, b, lo, hi, _ = fit
-    edge = min(hi, max(lo, x))
-    extension = EXTRAPOLATION_FRACTION * (x - edge)
-    extension = max(-MAX_EXTRAPOLATION_LOG, min(MAX_EXTRAPOLATION_LOG, extension))
-    return a + b * (edge + extension)
-
-
-def held_out_residuals(curves):
-    """Use a fixed number of fits rather than refitting once per comparable."""
-    residuals = [[] for _ in HOURS]
-    k = min(CALIBRATION_FOLDS, len(curves))
-    if k < 2:
-        return residuals
-    for fold in range(k):
-        training = [row for rank, row in enumerate(curves) if rank % k != fold]
-        fits = fit_curves(training)
-        for x, ratios in curves[fold::k]:
-            for idx, y in enumerate(ratios):
-                if y is not None and fits[idx] is not None:
-                    residuals[idx].append((x, y - fitted_ratio(fits[idx], x)))
-    return residuals
-
-
-def residual_distribution(residuals, target):
-    if not residuals:
+    Weights mix a uniform share with a Gaussian kernel over the hour-1
+    log print, so calibration leans on comparables whose opening hour
+    looked like this case's. Plotting positions put equal-weight
+    samples at i/(n+1).
+    """
+    if not errors:
         return []
-    n = len(residuals)
-    kernels = [
-        math.exp(-0.5 * ((source - target) / LOCAL_BANDWIDTH) ** 2)
-        for source, _ in residuals
-    ]
-    total = sum(kernels)
-    if total > 0.0:
-        weights = [
-            (1.0 - LOCAL_RESIDUAL_FRACTION) / n
-            + LOCAL_RESIDUAL_FRACTION * k / total
-            for k in kernels
-        ]
+    n = len(errors)
+    kernels = []
+    for src, _err in errors:
+        kernels.append(math.exp(-0.5 * ((src - target) / KERNEL_WIDTH) ** 2))
+    weights = [1.0 / n] * n
+    ksum = sum(kernels)
+    if ksum > 0.0:
+        weights = []
+        for k in kernels:
+            weights.append((1.0 - LOCAL_MIX) / n + LOCAL_MIX * k / ksum)
+    ranked = []
+    for (_src, err), w in zip(errors, weights):
+        ranked.append((err, w))
+    ranked.sort()
+    wsum = sum(w for _err, w in ranked)
+    mean_w = wsum / n
+    curve = []
+    accum = 0.0
+    for val, w in ranked:
+        p = (accum + 0.5 * (w + mean_w)) / (wsum + mean_w)
+        curve.append((p, val))
+        accum += w
+    return curve
+def cdf_value_at(curve, level):
+    """Invert a plotting-position CDF by linear interpolation."""
+    plo, vlo = curve[0]
+    if level <= plo:
+        return vlo
+    for k in range(1, len(curve)):
+        phi, vhi = curve[k]
+        if level <= phi:
+            return vlo + (vhi - vlo) * ((level - plo) / (phi - plo))
+        plo, vlo = phi, vhi
+    return vlo
+
+# ---- forecast assembly ----
+def levels_of(case):
+    """Read the case's quantile levels, repairing bad entries in place."""
+    raw = as_list(case.get("levels"))
+    if len(raw) != len(STD_LEVELS):
+        return STD_LEVELS
+    picked = []
+    for item, fallback in zip(raw, STD_LEVELS):
+        p = as_number(item)
+        picked.append(p if p is not None and 0.0 <= p <= 1.0 else fallback)
+    return tuple(picked)
+def zscore(prob):
+    """Standard normal quantile; exact table values for standard levels."""
+    for lvl, zval in zip(STD_LEVELS, STD_ZSCORES):
+        if prob == lvl:
+            return zval
+    clamped = max(TAIL_EPS, min(1.0 - TAIL_EPS, prob))
+    a = -10.0
+    b = 10.0
+    for _step in range(48):
+        m = (a + b) * 0.5
+        below = 0.5 * math.erfc(-m / math.sqrt(2.0)) < clamped
+        a = m if below else a
+        b = b if below else m
+    return (a + b) * 0.5
+def counts_row(log_vals):
+    """Convert log quantiles to viewer counts: monotone, capped, positive."""
+    row = []
+    running = -math.inf
+    for val in log_vals:
+        running = max(running, val)
+        row.append(Q_CEILING if running >= LOG_CEILING else min(Q_CEILING, math.exp(max(LOG_FLOOR, running))))
+    return row
+def build_forecast(case):
+    """Forecast one case: model quantiles blended with persistence.
+
+    Quantiles are computed in ascending level order so the monotone
+    repair inside counts_row runs the right way, then reordered to
+    match the case's own level order exactly. When the anchor did not
+    come from a valid known row the comparables are ignored and the
+    forecast falls back to persistence alone. Hours with too few
+    comparables blend toward persistence in proportion to their
+    sample count, and every tail is floored by a share of the
+    persistence spread and capped in log distance from the median.
+    """
+    case = case if isinstance(case, dict) else {}
+    anchor, trusted = anchor_print(case)
+    x = math.log(anchor)
+    levels = levels_of(case)
+    rank = sorted(range(len(levels)), key=lambda i: (levels[i], i))
+    asc = tuple(levels[i] for i in rank)
+    scores = tuple(zscore(p) for p in asc)
+    curves = extract_curves(case.get("comparables")) if trusted else []
+    if curves:
+        fits = fit_all_hours(curves)
+        calib = crossfit_errors(curves)
     else:
-        weights = [1.0 / n] * n
-
-    ranked = sorted((r, w) for (_, r), w in zip(residuals, weights))
-    total = sum(w for _, w in ranked)
-    average = total / n
-    cdf = []
-    mass = 0.0
-    for value, weight in ranked:
-        # At equal weights, these are i/(n+1) plotting positions.
-        p = (mass + 0.5 * (weight + average)) / (total + average)
-        cdf.append((p, value))
-        mass += weight
-    return cdf
-
-
-def empirical_quantile(cdf, level):
-    p0, v0 = cdf[0]
-    if level <= p0:
-        return v0
-    for i in range(1, len(cdf)):
-        p1, v1 = cdf[i]
-        if level <= p1:
-            return v0 + (v1 - v0) * ((level - p0) / (p1 - p0))
-        p0, v0 = p1, v1
-    return v0
-
-
-def case_levels(case):
-    raw = array(case.get("levels"))
-    if len(raw) != len(DEFAULT_LEVELS):
-        return DEFAULT_LEVELS
-    levels = []
-    for item, default in zip(raw, DEFAULT_LEVELS):
-        p = number(item)
-        levels.append(p if p is not None and 0.0 <= p <= 1.0 else default)
-    return tuple(levels)
-
-
-def normal_score(level):
-    for p, z in zip(DEFAULT_LEVELS, DEFAULT_Z):
-        if level == p:
-            return z
-    p = max(NORMAL_LEVEL_EPSILON, min(1.0 - NORMAL_LEVEL_EPSILON, level))
-    lo, hi = -10.0, 10.0
-    for _ in range(48):
-        mid = (lo + hi) * 0.5
-        if 0.5 * math.erfc(-mid / math.sqrt(2.0)) < p:
-            lo = mid
+        fits = [None] * len(FORECAST_HOURS)
+        calib = None
+    rows = []
+    for slot, hour in enumerate(FORECAST_HOURS):
+        sigma = DRIFT_SIGMA * math.sqrt(hour - 1)
+        base_offsets = [z * sigma for z in scores]
+        line = fits[slot]
+        if line is None:
+            logs = [x + off for off in base_offsets]
         else:
-            hi = mid
-    return (lo + hi) * 0.5
-
-
-def quantile_row(log_quantiles):
-    values = []
-    previous = -math.inf
-    for value in log_quantiles:
-        # Cumulative max in log space is the same monotone fix on counts.
-        previous = max(previous, value)
-        if previous >= LOG_MAX_Q:
-            values.append(MAX_Q)
-        else:
-            values.append(min(MAX_Q, math.exp(max(LOG_MIN_Q, previous))))
-    return values
-
-
-def forecast(case):
-    if not isinstance(case, dict):
-        case = {}
-    p1, known = hour_one(case)
-    x = math.log(p1)
-    levels = case_levels(case)
-    # Compute quantiles in ascending level order (so the monotone repair in
-    # quantile_row runs the right way), then reorder to the case's order.
-    # For the standard levels this order is the identity: no behavior change.
-    order = sorted(range(len(levels)), key=lambda i: (levels[i], i))
-    asc_levels = tuple(levels[i] for i in order)
-    scores = tuple(normal_score(p) for p in asc_levels)
-
-    curves = comparable_curves(case.get("comparables")) if known else []
-    fits = fit_curves(curves) if curves else [None] * len(HOURS)
-    calibration = held_out_residuals(curves) if curves else None
-
-    output = []
-    for idx, hour in enumerate(HOURS):
-        sigma = PERSISTENCE_SIGMA * math.sqrt(hour - 1)
-        persistence = [z * sigma for z in scores]
-        fit = fits[idx]
-        if fit is None:
-            logs = [x + offset for offset in persistence]
-        else:
-            _, _, lo, hi, n = fit
-            blend = min(1.0, n / FULL_MODEL_COUNT)
-            cdf = residual_distribution(calibration[idx], min(hi, max(lo, x)))
-            correction = empirical_quantile(cdf, 0.5) if cdf else 0.0
-            center = fitted_ratio(fit, x) + correction
+            _a, _b, lo, hi, n = line
+            blend = min(1.0, n / FULL_WEIGHT_N)
+            curve = error_cdf(calib[slot], min(hi, max(lo, x)))
+            shift = cdf_value_at(curve, 0.5) if curve else 0.0
+            center = ratio_at(line, x) + shift
             logs = []
-            for p, z, fallback in zip(asc_levels, scores, persistence):
-                if cdf:
-                    delta = empirical_quantile(cdf, p) - correction
+            for p, z, off in zip(asc, scores, base_offsets):
+                if curve:
+                    delta = cdf_value_at(curve, p) - shift
                 else:
-                    delta = fallback
-
-                floor = SPREAD_FLOOR_FRACTION * abs(fallback)
-                if z < 0.0:
-                    delta = -min(MAX_TAIL_LOG_DISTANCE, max(floor, -delta))
-                elif z > 0.0:
-                    delta = min(MAX_TAIL_LOG_DISTANCE, max(floor, delta))
-                else:
+                    delta = off
+                floor = SPREAD_FLOOR * abs(off)
+                if z == 0.0:
                     delta = 0.0
+                elif z < 0.0:
+                    delta = -min(TAIL_CAP, max(floor, -delta))
+                else:
+                    delta = min(TAIL_CAP, max(floor, delta))
+                mixed = (1.0 - blend) * off + blend * (center + delta)
+                logs.append(x + mixed)
+        asc_q = counts_row(logs)
+        out_q = [0.0] * len(levels)
+        for place, i in enumerate(rank):
+            out_q[i] = asc_q[place]
+        rows.append({"hour": hour, "q": out_q})
+    return {"hours": rows}
 
-                ratio = (1.0 - blend) * fallback + blend * (center + delta)
-                logs.append(x + ratio)
+# ---- program entry ----
+def load_case(path):
+    """Read one case file; bad files degrade to an empty case.
 
-        q_asc = quantile_row(logs)
-        q = [0.0] * len(levels)
-        for pos, i in enumerate(order):
-            q[i] = q_asc[pos]
-        output.append({"hour": hour, "q": q})
-    return {"hours": output}
-
-
-def read_case(path):
-    # Recover from bad files here, not from programming errors in the model.
-    # utf-8-sig tolerates a BOM; without it a BOM'd file would parse as
-    # invalid JSON and the whole case would fall back to a print of 1.
-    try:
-        with open(path, "r", encoding="utf-8-sig") as handle:
-            return json.load(handle)
-    except (OSError, ValueError, RecursionError):
-        return {}
-
-
-def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(output_dir, exist_ok=True)
-    try:
-        names = sorted(os.listdir(input_dir))
-    except OSError:
-        # No readable input directory: nothing to forecast, exit cleanly.
-        return
-    for name in names:
-        if not name.endswith(".in"):
+    The utf-8-sig codec discards a leading byte-order mark, without
+    which a BOM'd file would fail JSON parsing and lose its hour-1
+    print. Only file and parse errors are caught here, never model
+    errors.
+    """
+    try:  # file and parse errors degrade to an empty case
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            return json.load(stream)
+    except (OSError, ValueError, RecursionError) as _exc:
+        return dict()
+def run_all():
+    """Forecast every .in file in the input dir into the output dir."""
+    src_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    dst_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(dst_dir, exist_ok=True)
+    try:  # a missing input dir means there is nothing to forecast
+        entries = sorted(os.listdir(src_dir))
+    except OSError as _missing:
+        entries = []
+    for name in entries:
+        if name[-3:] != ".in":
             continue
-        case = read_case(os.path.join(input_dir, name))
-        result = forecast(case)
-        # Fixed keys and 115 bounded floats keep the payload far below 64 KiB.
-        text = json.dumps(result, separators=(",", ":"), allow_nan=False) + "\n"
-        path = os.path.join(output_dir, name[:-3] + ".out")
-        with open(path, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-
-
-if __name__ == "__main__":
-    main()
+        case = load_case(os.path.join(src_dir, name))
+        result = build_forecast(case)
+        payload = json.dumps(result, separators=(",", ":"), allow_nan=False) + "\n"
+        target = os.path.join(dst_dir, name[:-3] + ".out")
+        with open(target, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+if __name__ == "__main__": run_all()
